@@ -107,9 +107,7 @@ class WithdrawService:
         # Debit BEFORE persisting: a pending row must always be backed by
         # a real debit, otherwise an admin could approve money that was
         # never taken from the balance.
-        payout_amount, currency = source.debit(
-            user_id, amount, reference_id=request.id
-        )
+        payout_amount, currency = source.debit(user_id, amount, reference_id=request.id)
         request.payout_amount = payout_amount
         request.currency = currency
         self._repository.create(request)
@@ -128,9 +126,7 @@ class WithdrawService:
         self._execute_payout(request, provider, source)
         return request
 
-    def reject(
-        self, request_id: UUID, reason: Optional[str] = None
-    ) -> WithdrawRequest:
+    def reject(self, request_id: UUID, reason: Optional[str] = None) -> WithdrawRequest:
         """Reject a pending request and refund the debited amount."""
         request = self._find_or_raise(request_id)
         self._require_status(request, STATUS_PENDING)
@@ -144,9 +140,7 @@ class WithdrawService:
     def list_own(self, user_id: UUID) -> List[WithdrawRequest]:
         return self._repository.find_by_user_id(user_id)
 
-    def get_own(
-        self, request_id: UUID, user_id: UUID
-    ) -> Optional[WithdrawRequest]:
+    def get_own(self, request_id: UUID, user_id: UUID) -> Optional[WithdrawRequest]:
         """The request, or None when it doesn't exist or belongs to
         someone else (owner-only read — callers answer 404 either way)."""
         request = self._repository.find_by_id(request_id)

@@ -107,9 +107,7 @@ def list_payout_providers():
                 "providers": providers,
                 "config": {
                     "currency": str(config["currency"]),
-                    "token_to_currency_rate": float(
-                        config["token_to_currency_rate"]
-                    ),
+                    "token_to_currency_rate": float(config["token_to_currency_rate"]),
                     "min_withdraw_tokens": int(config["min_withdraw_tokens"]),
                 },
             }

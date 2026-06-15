@@ -190,9 +190,7 @@ class TestCreateValidation:
 class TestOwnerReads:
     def test_unknown_request_id_returns_404(self, app, client):
         with _authenticated(app, uuid4()):
-            response = client.get(
-                f"{REQUESTS_PATH}/{uuid4()}", headers=_auth_headers()
-            )
+            response = client.get(f"{REQUESTS_PATH}/{uuid4()}", headers=_auth_headers())
         assert response.status_code == 404
 
     def test_malformed_request_id_returns_404(self, app, client):

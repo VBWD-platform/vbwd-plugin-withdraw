@@ -31,9 +31,7 @@ def upgrade():
     op.create_table(
         TABLE_NAME,
         sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column(
-            "user_id", sa.dialects.postgresql.UUID(as_uuid=True), nullable=False
-        ),
+        sa.Column("user_id", sa.dialects.postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column(
             "balance_source",
             sa.String(50),
@@ -44,12 +42,8 @@ def upgrade():
         sa.Column("payout_amount", sa.Numeric(12, 2), nullable=False),
         sa.Column("currency", sa.String(3), nullable=False),
         sa.Column("provider", sa.String(50), nullable=False),
-        sa.Column(
-            "destination", sa.dialects.postgresql.JSONB(), nullable=False
-        ),
-        sa.Column(
-            "status", sa.String(20), nullable=False, server_default="pending"
-        ),
+        sa.Column("destination", sa.dialects.postgresql.JSONB(), nullable=False),
+        sa.Column("status", sa.String(20), nullable=False, server_default="pending"),
         sa.Column("provider_payout_id", sa.String(255), nullable=True),
         sa.Column("error", sa.String(512), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
