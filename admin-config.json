@@ -1,0 +1,15 @@
+{
+  "tabs": [
+    {
+      "id": "general",
+      "label": "General",
+      "fields": [
+        { "key": "debug_mode", "label": "Debug mode", "component": "checkbox" },
+        { "key": "token_to_currency_rate", "label": "Token to currency rate", "component": "input", "inputType": "number" },
+        { "key": "currency", "label": "Payout currency (ISO 4217)", "component": "input" },
+        { "key": "min_withdraw_tokens", "label": "Minimum withdraw (tokens)", "component": "input", "inputType": "number" },
+        { "key": "require_admin_approval", "label": "Require admin approval before payout", "component": "checkbox" }
+      ]
+    }
+  ]
+}

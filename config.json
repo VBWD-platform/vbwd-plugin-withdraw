@@ -1,0 +1,7 @@
+{
+  "debug_mode": false,
+  "token_to_currency_rate": 0.01,
+  "currency": "EUR",
+  "min_withdraw_tokens": 100,
+  "require_admin_approval": true
+}
