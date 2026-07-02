@@ -7,6 +7,7 @@ the providers endpoint discovers payout-capable plugins via a patched
 Slice 2).
 """
 from contextlib import ExitStack, contextmanager
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -18,6 +19,14 @@ from plugins.withdraw.tests.unit.fakes import (
     FAKE_DESTINATION_SCHEMA,
     FAKE_PROVIDER_NAME,
     FakePayoutPlugin,
+)
+from plugins.withdraw.withdraw.services.balance_sources import (
+    InsufficientBalanceError,
+    UnknownBalanceSourceError,
+)
+from plugins.withdraw.withdraw.services.withdraw_service import (
+    InvalidWithdrawStatusError,
+    WithdrawRequestNotFoundError,
 )
 
 
@@ -67,8 +76,11 @@ class TestAuthRequired:
             ("GET", REQUESTS_PATH),
             ("GET", f"{REQUESTS_PATH}/{uuid4()}"),
             ("GET", ADMIN_REQUESTS_PATH),
+            ("GET", f"{ADMIN_REQUESTS_PATH}/{uuid4()}"),
             ("POST", f"{ADMIN_REQUESTS_PATH}/{uuid4()}/approve"),
             ("POST", f"{ADMIN_REQUESTS_PATH}/{uuid4()}/reject"),
+            ("POST", f"{ADMIN_REQUESTS_PATH}/{uuid4()}/pending"),
+            ("DELETE", f"{ADMIN_REQUESTS_PATH}/{uuid4()}"),
         ],
     )
     def test_without_token_returns_401(self, client, method, path):
@@ -79,8 +91,11 @@ class TestAuthRequired:
         "method,path",
         [
             ("GET", ADMIN_REQUESTS_PATH),
+            ("GET", f"{ADMIN_REQUESTS_PATH}/{uuid4()}"),
             ("POST", f"{ADMIN_REQUESTS_PATH}/{uuid4()}/approve"),
             ("POST", f"{ADMIN_REQUESTS_PATH}/{uuid4()}/reject"),
+            ("POST", f"{ADMIN_REQUESTS_PATH}/{uuid4()}/pending"),
+            ("DELETE", f"{ADMIN_REQUESTS_PATH}/{uuid4()}"),
         ],
     )
     def test_admin_routes_refuse_non_admin_users(self, app, client, method, path):
@@ -199,3 +214,177 @@ class TestOwnerReads:
                 f"{REQUESTS_PATH}/not-a-uuid", headers=_auth_headers()
             )
         assert response.status_code == 404
+
+
+@contextmanager
+def _patched_admin_service(app, admin_id):
+    """Run as an admin with the route's service factory patched to a mock,
+    so route-level error mapping is exercised without a live DB/balance."""
+    service = MagicMock()
+    with _authenticated(app, admin_id, is_admin=True), patch(
+        "plugins.withdraw.withdraw.routes._withdraw_service", return_value=service
+    ):
+        yield service
+
+
+class TestAdminSetPendingRoute:
+    def _path(self, request_id):
+        return f"{ADMIN_REQUESTS_PATH}/{request_id}/pending"
+
+    def test_success_returns_200_with_the_row(self, app, client):
+        row = MagicMock()
+        row.to_dict.return_value = {"id": "abc", "status": "pending"}
+        with _patched_admin_service(app, uuid4()) as service:
+            service.set_pending.return_value = row
+            response = client.post(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 200
+        assert response.get_json() == {"request": {"id": "abc", "status": "pending"}}
+
+    def test_malformed_id_returns_404(self, app, client):
+        with _authenticated(app, uuid4(), is_admin=True):
+            response = client.post(
+                f"{ADMIN_REQUESTS_PATH}/not-a-uuid/pending", headers=_auth_headers()
+            )
+        assert response.status_code == 404
+
+    def test_unknown_request_returns_404(self, app, client):
+        with _patched_admin_service(app, uuid4()) as service:
+            service.set_pending.side_effect = WithdrawRequestNotFoundError("nope")
+            response = client.post(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 404
+
+    def test_wrong_status_returns_409(self, app, client):
+        with _patched_admin_service(app, uuid4()) as service:
+            service.set_pending.side_effect = InvalidWithdrawStatusError("bad")
+            response = client.post(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 409
+
+    @pytest.mark.parametrize(
+        "error", [InsufficientBalanceError("broke"), UnknownBalanceSourceError("x")]
+    )
+    def test_money_errors_return_400(self, app, client, error):
+        with _patched_admin_service(app, uuid4()) as service:
+            service.set_pending.side_effect = error
+            response = client.post(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 400
+
+
+class TestAdminGetSingleRoute:
+    def _path(self, request_id):
+        return f"{ADMIN_REQUESTS_PATH}/{request_id}"
+
+    def test_success_returns_200_with_the_row(self, app, client):
+        row = MagicMock()
+        row.to_dict.return_value = {"id": "abc", "status": "pending"}
+        with _patched_admin_service(app, uuid4()) as service:
+            service.admin_get.return_value = row
+            response = client.get(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 200
+        assert response.get_json() == {"request": {"id": "abc", "status": "pending"}}
+
+    def test_malformed_id_returns_404(self, app, client):
+        with _authenticated(app, uuid4(), is_admin=True):
+            response = client.get(
+                f"{ADMIN_REQUESTS_PATH}/not-a-uuid", headers=_auth_headers()
+            )
+        assert response.status_code == 404
+        assert response.get_json() == {"error": "Withdraw request not found"}
+
+    def test_unknown_request_returns_404(self, app, client):
+        with _patched_admin_service(app, uuid4()) as service:
+            service.admin_get.side_effect = WithdrawRequestNotFoundError("nope")
+            response = client.get(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 404
+
+
+class TestAdminApproveRoute:
+    def _path(self, request_id):
+        return f"{ADMIN_REQUESTS_PATH}/{request_id}/approve"
+
+    def test_without_body_approves_with_no_override(self, app, client):
+        row = MagicMock()
+        row.to_dict.return_value = {"id": "abc", "status": "completed"}
+        with _patched_admin_service(app, uuid4()) as service:
+            service.approve.return_value = row
+            response = client.post(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 200
+        assert response.get_json() == {"request": {"id": "abc", "status": "completed"}}
+        service.approve.assert_called_once()
+        _, kwargs = service.approve.call_args
+        assert kwargs["payout_amount_override"] is None
+
+    def test_valid_payout_amount_passes_the_override(self, app, client):
+        row = MagicMock()
+        row.to_dict.return_value = {"id": "abc", "status": "completed"}
+        with _patched_admin_service(app, uuid4()) as service:
+            service.approve.return_value = row
+            response = client.post(
+                self._path(uuid4()),
+                headers=_auth_headers(),
+                json={"payout_amount": "2.75"},
+            )
+        assert response.status_code == 200
+        _, kwargs = service.approve.call_args
+        assert kwargs["payout_amount_override"] == Decimal("2.75")
+
+    @pytest.mark.parametrize("bad_amount", ["not-a-number", -5, 0, "-1.00", True])
+    def test_invalid_payout_amount_returns_400(self, app, client, bad_amount):
+        with _patched_admin_service(app, uuid4()) as service:
+            response = client.post(
+                self._path(uuid4()),
+                headers=_auth_headers(),
+                json={"payout_amount": bad_amount},
+            )
+        assert response.status_code == 400
+        assert response.get_json() == {"error": "Invalid payout amount"}
+        service.approve.assert_not_called()
+
+    def test_malformed_id_returns_404(self, app, client):
+        with _authenticated(app, uuid4(), is_admin=True):
+            response = client.post(
+                f"{ADMIN_REQUESTS_PATH}/not-a-uuid/approve", headers=_auth_headers()
+            )
+        assert response.status_code == 404
+
+    def test_unknown_request_returns_404(self, app, client):
+        with _patched_admin_service(app, uuid4()) as service:
+            service.approve.side_effect = WithdrawRequestNotFoundError("nope")
+            response = client.post(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 404
+
+    def test_non_pending_request_returns_409(self, app, client):
+        with _patched_admin_service(app, uuid4()) as service:
+            service.approve.side_effect = InvalidWithdrawStatusError("bad")
+            response = client.post(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 409
+
+
+class TestAdminDeleteRoute:
+    def _path(self, request_id):
+        return f"{ADMIN_REQUESTS_PATH}/{request_id}"
+
+    def test_success_returns_200(self, app, client):
+        with _patched_admin_service(app, uuid4()) as service:
+            service.delete.return_value = None
+            response = client.delete(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 200
+        assert response.get_json() == {"success": True}
+
+    def test_malformed_id_returns_404(self, app, client):
+        with _authenticated(app, uuid4(), is_admin=True):
+            response = client.delete(
+                f"{ADMIN_REQUESTS_PATH}/not-a-uuid", headers=_auth_headers()
+            )
+        assert response.status_code == 404
+
+    def test_unknown_request_returns_404(self, app, client):
+        with _patched_admin_service(app, uuid4()) as service:
+            service.delete.side_effect = WithdrawRequestNotFoundError("nope")
+            response = client.delete(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 404
+
+    def test_wrong_status_returns_409(self, app, client):
+        with _patched_admin_service(app, uuid4()) as service:
+            service.delete.side_effect = InvalidWithdrawStatusError("bad")
+            response = client.delete(self._path(uuid4()), headers=_auth_headers())
+        assert response.status_code == 409

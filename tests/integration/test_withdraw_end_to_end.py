@@ -25,7 +25,9 @@ from plugins.withdraw.withdraw.services.balance_sources import (
     UnknownBalanceSourceError,
 )
 from plugins.withdraw.withdraw.services.withdraw_service import (
+    InvalidWithdrawStatusError,
     UnknownPayoutProviderError,
+    WithdrawRequestNotFoundError,
     WithdrawService,
 )
 from plugins.withdraw.tests.unit.fakes import (
@@ -161,6 +163,116 @@ def test_reject_refunds_the_tokens(app, user, token_service):
     assert [row.amount for row in ledger_rows] == [-150, 150]
     assert all(row.reference_id == request.id for row in ledger_rows)
     assert provider.create_payout_calls == []
+
+
+@pytest.mark.integration
+def test_set_pending_re_debits_a_rejected_request(app, user, token_service):
+    from vbwd.extensions import db
+
+    provider = RecordingPayoutProvider()
+    service = _service(app, token_service, provider)
+
+    request = service.create(
+        user.id, FAKE_PROVIDER_NAME, 150, {"email": "payee@example.com"}
+    )
+    service.reject(request.id, reason="not today")
+    assert token_service.get_balance(user.id) == INITIAL_TOKENS
+
+    reopened = service.set_pending(request.id)
+
+    assert reopened.status == STATUS_PENDING
+    assert reopened.error is None
+    # the balance is DEBITED again — the reopened request is money-backed
+    assert token_service.get_balance(user.id) == INITIAL_TOKENS - 150
+    ledger_rows = _withdraw_ledger_rows(user.id)
+    assert [row.amount for row in ledger_rows] == [-150, 150, -150]
+    assert all(row.reference_id == request.id for row in ledger_rows)
+
+    reloaded = WithdrawRequestRepository(db.session).find_by_id(request.id)
+    assert reloaded.status == STATUS_PENDING
+
+
+@pytest.mark.integration
+def test_set_pending_refuses_a_pending_request_without_extra_debit(
+    app, user, token_service
+):
+    service = _service(app, token_service, RecordingPayoutProvider())
+
+    request = service.create(
+        user.id, FAKE_PROVIDER_NAME, 150, {"email": "payee@example.com"}
+    )
+    assert token_service.get_balance(user.id) == INITIAL_TOKENS - 150
+
+    with pytest.raises(InvalidWithdrawStatusError):
+        service.set_pending(request.id)
+
+    # no second debit — the live one still stands, balance unchanged
+    assert token_service.get_balance(user.id) == INITIAL_TOKENS - 150
+    assert len(_withdraw_ledger_rows(user.id)) == 1
+
+
+@pytest.mark.integration
+def test_set_pending_unknown_request_raises_not_found(app, user, token_service):
+    service = _service(app, token_service, RecordingPayoutProvider())
+
+    with pytest.raises(WithdrawRequestNotFoundError):
+        service.set_pending(uuid4())
+
+
+@pytest.mark.integration
+def test_delete_removes_a_rejected_request(app, user, token_service):
+    from vbwd.extensions import db
+
+    service = _service(app, token_service, RecordingPayoutProvider())
+    request = service.create(
+        user.id, FAKE_PROVIDER_NAME, 150, {"email": "payee@example.com"}
+    )
+    service.reject(request.id, reason="not today")
+
+    service.delete(request.id)
+
+    assert WithdrawRequestRepository(db.session).find_by_id(request.id) is None
+
+
+@pytest.mark.integration
+def test_delete_removes_a_completed_request(app, user, token_service):
+    from vbwd.extensions import db
+
+    provider = RecordingPayoutProvider(payout_status="completed")
+    service = _service(app, token_service, provider)
+    request = service.create(
+        user.id, FAKE_PROVIDER_NAME, 200, {"email": "payee@example.com"}
+    )
+    approved = service.approve(request.id)
+    assert approved.status == STATUS_COMPLETED
+
+    service.delete(request.id)
+
+    assert WithdrawRequestRepository(db.session).find_by_id(request.id) is None
+
+
+@pytest.mark.integration
+def test_delete_refuses_a_pending_request(app, user, token_service):
+    from vbwd.extensions import db
+
+    service = _service(app, token_service, RecordingPayoutProvider())
+    request = service.create(
+        user.id, FAKE_PROVIDER_NAME, 150, {"email": "payee@example.com"}
+    )
+
+    with pytest.raises(InvalidWithdrawStatusError):
+        service.delete(request.id)
+
+    # the live-debit row is NOT stranded — it still exists
+    assert WithdrawRequestRepository(db.session).find_by_id(request.id) is not None
+
+
+@pytest.mark.integration
+def test_delete_unknown_request_raises_not_found(app, user, token_service):
+    service = _service(app, token_service, RecordingPayoutProvider())
+
+    with pytest.raises(WithdrawRequestNotFoundError):
+        service.delete(uuid4())
 
 
 @pytest.mark.integration

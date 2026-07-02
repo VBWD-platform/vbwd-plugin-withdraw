@@ -208,6 +208,50 @@ class TestApprove:
         assert "rejected" in request.error
         assert source.refund_calls == [(user_id, 150, request.id)]
 
+    def test_approve_without_override_uses_the_converted_payout_amount(self):
+        source = InMemoryWithdrawableBalance(tokens=500)
+        provider = RecordingPayoutProvider(payout_status="completed")
+        repository = MagicMock()
+        service = _service(provider, source, repository)
+        request = service.create(uuid4(), FAKE_PROVIDER_NAME, 150, DESTINATION)
+        repository.find_by_id.return_value = request
+
+        service.approve(request.id)
+
+        assert request.payout_amount == Decimal("1.50")
+        assert provider.create_payout_calls[0][0] == Decimal("1.50")
+
+    def test_approve_with_override_sends_and_records_the_overridden_amount(self):
+        source = InMemoryWithdrawableBalance(tokens=500)
+        provider = RecordingPayoutProvider(payout_status="completed")
+        repository = MagicMock()
+        service = _service(provider, source, repository)
+        request = service.create(uuid4(), FAKE_PROVIDER_NAME, 150, DESTINATION)
+        repository.find_by_id.return_value = request
+
+        service.approve(request.id, payout_amount_override=Decimal("2.75"))
+
+        assert request.payout_amount == Decimal("2.75")
+        assert provider.create_payout_calls[0][0] == Decimal("2.75")
+        # the token debit is intentionally left unchanged by the override
+        assert request.amount == 150
+
+    @pytest.mark.parametrize("bad_override", [Decimal("0"), Decimal("-1.00")])
+    def test_approve_with_non_positive_override_is_refused_without_payout(
+        self, bad_override
+    ):
+        source = InMemoryWithdrawableBalance(tokens=500)
+        provider = RecordingPayoutProvider()
+        repository = MagicMock()
+        service = _service(provider, source, repository)
+        request = service.create(uuid4(), FAKE_PROVIDER_NAME, 150, DESTINATION)
+        repository.find_by_id.return_value = request
+
+        with pytest.raises(ValueError):
+            service.approve(request.id, payout_amount_override=bad_override)
+
+        assert provider.create_payout_calls == []
+
     def test_approve_unknown_request_raises_not_found(self):
         repository = MagicMock()
         repository.find_by_id.return_value = None
@@ -263,6 +307,152 @@ class TestReject:
             service.reject(request.id)
 
         assert source.refund_calls == []
+
+
+class TestSetPending:
+    def _service_with(self, source, repository):
+        return _service(RecordingPayoutProvider(), source, repository)
+
+    def _persisted_request(self, service, source, user_id, status):
+        request = service.create(user_id, FAKE_PROVIDER_NAME, 150, DESTINATION)
+        request.status = status
+        return request
+
+    @pytest.mark.parametrize("status", [STATUS_REJECTED, STATUS_FAILED])
+    def test_reopens_a_refunded_request_and_re_debits(self, status):
+        source = InMemoryWithdrawableBalance(tokens=500)
+        repository = MagicMock()
+        user_id = uuid4()
+        service = self._service_with(source, repository)
+        request = self._persisted_request(service, source, user_id, status)
+        request.error = "previous failure"
+        repository.find_by_id.return_value = request
+        debits_before = list(source.debit_calls)
+
+        reopened = service.set_pending(request.id)
+
+        assert reopened.status == STATUS_PENDING
+        assert reopened.error is None
+        # exactly one NEW debit, audit-tagged with the request id
+        assert source.debit_calls == debits_before + [(user_id, 150, request.id)]
+        repository.save.assert_called_once_with(request)
+
+    @pytest.mark.parametrize(
+        "status",
+        [STATUS_PENDING, STATUS_APPROVED, STATUS_PROCESSING, STATUS_COMPLETED],
+    )
+    def test_refuses_a_non_refunded_request_without_debit(self, status):
+        source = InMemoryWithdrawableBalance(tokens=500)
+        repository = MagicMock()
+        service = self._service_with(source, repository)
+        request = self._persisted_request(service, source, uuid4(), status)
+        repository.find_by_id.return_value = request
+        debits_before = list(source.debit_calls)
+
+        with pytest.raises(InvalidWithdrawStatusError):
+            service.set_pending(request.id)
+
+        assert source.debit_calls == debits_before
+        repository.save.assert_not_called()
+
+    def test_insufficient_balance_propagates(self):
+        source = InMemoryWithdrawableBalance(tokens=150)
+        repository = MagicMock()
+        service = self._service_with(source, repository)
+        request = self._persisted_request(service, source, uuid4(), STATUS_REJECTED)
+        # tokens were refunded back to 300 in the fake on reject-equivalent;
+        # force the balance below the amount to trigger the guard
+        source.tokens = 100
+        repository.find_by_id.return_value = request
+
+        with pytest.raises(InsufficientBalanceError):
+            service.set_pending(request.id)
+
+    def test_unknown_request_raises_not_found(self):
+        repository = MagicMock()
+        repository.find_by_id.return_value = None
+        service = self._service_with(
+            InMemoryWithdrawableBalance(tokens=500), repository
+        )
+
+        with pytest.raises(WithdrawRequestNotFoundError):
+            service.set_pending(uuid4())
+
+
+class TestDelete:
+    def _persisted_request(self, service, user_id, status):
+        request = service.create(user_id, FAKE_PROVIDER_NAME, 150, DESTINATION)
+        request.status = status
+        return request
+
+    @pytest.mark.parametrize(
+        "status", [STATUS_REJECTED, STATUS_FAILED, STATUS_COMPLETED]
+    )
+    def test_deletes_a_terminal_request(self, status):
+        source = InMemoryWithdrawableBalance(tokens=500)
+        repository = MagicMock()
+        service = _service(RecordingPayoutProvider(), source, repository)
+        request = self._persisted_request(service, uuid4(), status)
+        repository.find_by_id.return_value = request
+
+        service.delete(request.id)
+
+        repository.delete.assert_called_once_with(request)
+
+    @pytest.mark.parametrize(
+        "status", [STATUS_PENDING, STATUS_APPROVED, STATUS_PROCESSING]
+    )
+    def test_refuses_a_request_holding_a_live_debit(self, status):
+        source = InMemoryWithdrawableBalance(tokens=500)
+        repository = MagicMock()
+        service = _service(RecordingPayoutProvider(), source, repository)
+        request = self._persisted_request(service, uuid4(), status)
+        repository.find_by_id.return_value = request
+
+        with pytest.raises(InvalidWithdrawStatusError):
+            service.delete(request.id)
+
+        repository.delete.assert_not_called()
+
+    def test_unknown_request_raises_not_found(self):
+        repository = MagicMock()
+        repository.find_by_id.return_value = None
+        service = _service(
+            RecordingPayoutProvider(),
+            InMemoryWithdrawableBalance(tokens=500),
+            repository,
+        )
+
+        with pytest.raises(WithdrawRequestNotFoundError):
+            service.delete(uuid4())
+
+
+class TestAdminGet:
+    def test_admin_get_returns_the_request(self):
+        repository = MagicMock()
+        row = MagicMock()
+        repository.find_by_id.return_value = row
+        service = _service(
+            RecordingPayoutProvider(),
+            InMemoryWithdrawableBalance(tokens=500),
+            repository,
+        )
+        request_id = uuid4()
+
+        assert service.admin_get(request_id) is row
+        repository.find_by_id.assert_called_once_with(request_id)
+
+    def test_admin_get_unknown_request_raises_not_found(self):
+        repository = MagicMock()
+        repository.find_by_id.return_value = None
+        service = _service(
+            RecordingPayoutProvider(),
+            InMemoryWithdrawableBalance(tokens=500),
+            repository,
+        )
+
+        with pytest.raises(WithdrawRequestNotFoundError):
+            service.admin_get(uuid4())
 
 
 class TestReads:

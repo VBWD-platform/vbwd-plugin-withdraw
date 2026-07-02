@@ -21,6 +21,10 @@ class WithdrawRequestRepository:
         self._session.commit()
         return request
 
+    def delete(self, request: WithdrawRequest) -> None:
+        self._session.delete(request)
+        self._session.commit()
+
     def find_by_id(self, request_id: UUID) -> Optional[WithdrawRequest]:
         return (
             self._session.query(WithdrawRequest)

@@ -12,7 +12,8 @@ Collaborators arrive as narrow callables/ports (DI): the repository,
 a `balance_source` resolver and a payout-provider resolver — the
 service knows neither the plugin manager nor any concrete provider.
 """
-from typing import Any, Callable, Dict, List, Optional
+from decimal import Decimal
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 from vbwd.plugins.payment_provider import PayoutError, PayoutProvider
@@ -116,11 +117,30 @@ class WithdrawService:
             self._execute_payout(request, provider, source)
         return request
 
-    def approve(self, request_id: UUID) -> WithdrawRequest:
+    def approve(
+        self,
+        request_id: UUID,
+        payout_amount_override: Optional[Decimal] = None,
+    ) -> WithdrawRequest:
         """Send the payout for a pending request; `PayoutError` marks it
-        failed and refunds exactly once."""
+        failed and refunds exactly once.
+
+        `payout_amount_override` lets an admin send an edited fiat sum to
+        the provider (e.g. correct or cap the auto-calculated amount). It
+        must be a positive `Decimal`; the token `amount` debit is left
+        unchanged — only the fiat sum forwarded to the provider changes.
+
+        Raises:
+            WithdrawRequestNotFoundError, InvalidWithdrawStatusError,
+            ValueError (non-positive override), UnknownPayoutProviderError,
+            UnknownBalanceSourceError
+        """
         request = self._find_or_raise(request_id)
         self._require_status(request, STATUS_PENDING)
+        if payout_amount_override is not None:
+            if payout_amount_override <= 0:
+                raise ValueError("payout_amount_override must be positive")
+            request.payout_amount = payout_amount_override
         provider = self._payout_provider_resolver(request.provider)
         source = self._balance_source_resolver(request.balance_source)
         self._execute_payout(request, provider, source)
@@ -137,6 +157,48 @@ class WithdrawService:
         self._repository.save(request)
         return request
 
+    def set_pending(self, request_id: UUID) -> WithdrawRequest:
+        """Reopen a refunded request (`rejected`/`failed`) back to `pending`
+        so an admin can retry the payout.
+
+        Only a refunded request may be reopened: a pending/approved/
+        processing one still holds its live debit (reopening would debit
+        twice) and a completed one was already paid out (reopening would
+        resurrect a settled payout). Reopening RE-DEBITS the balance so the
+        pending row is money-backed again, exactly as `create` guarantees.
+
+        Raises:
+            WithdrawRequestNotFoundError, InvalidWithdrawStatusError,
+            InsufficientBalanceError, UnknownBalanceSourceError
+        """
+        request = self._find_or_raise(request_id)
+        self._require_status_in(request, (STATUS_REJECTED, STATUS_FAILED))
+        source = self._balance_source_resolver(request.balance_source)
+        payout_amount, currency = source.debit(
+            request.user_id, request.amount, reference_id=request.id
+        )
+        request.payout_amount = payout_amount
+        request.currency = currency
+        request.status = STATUS_PENDING
+        request.error = None
+        self._repository.save(request)
+        return request
+
+    def delete(self, request_id: UUID) -> None:
+        """Hard-delete a settled request (`rejected`/`failed`/`completed`).
+
+        A pending/approved/processing request still holds a live debit —
+        deleting it would strand the user's money — so those are refused.
+
+        Raises:
+            WithdrawRequestNotFoundError, InvalidWithdrawStatusError
+        """
+        request = self._find_or_raise(request_id)
+        self._require_status_in(
+            request, (STATUS_REJECTED, STATUS_FAILED, STATUS_COMPLETED)
+        )
+        self._repository.delete(request)
+
     def list_own(self, user_id: UUID) -> List[WithdrawRequest]:
         return self._repository.find_by_user_id(user_id)
 
@@ -150,6 +212,11 @@ class WithdrawService:
 
     def admin_list(self, status: Optional[str] = None) -> List[WithdrawRequest]:
         return self._repository.find_all(status=status)
+
+    def admin_get(self, request_id: UUID) -> WithdrawRequest:
+        """The request by id (admin read), raising
+        `WithdrawRequestNotFoundError` when it doesn't exist."""
+        return self._find_or_raise(request_id)
 
     def _execute_payout(
         self,
@@ -190,4 +257,14 @@ class WithdrawService:
         if request.status != expected_status:
             raise InvalidWithdrawStatusError(
                 f"Withdraw request is {request.status}, expected {expected_status}"
+            )
+
+    @staticmethod
+    def _require_status_in(
+        request: WithdrawRequest, allowed_statuses: Tuple[str, ...]
+    ) -> None:
+        if request.status not in allowed_statuses:
+            raise InvalidWithdrawStatusError(
+                f"Withdraw request is {request.status}, "
+                f"expected one of {', '.join(allowed_statuses)}"
             )

@@ -8,7 +8,8 @@ provider registered in `on_enable` (validates the full runtime path).
 THIS CONTRACT IS FIXED — the fe-user withdraw plugin is built against
 it in parallel.
 """
-from typing import List, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Any, List, Optional
 from uuid import UUID
 
 from flask import Blueprint, current_app, g, jsonify, request
@@ -85,6 +86,18 @@ def _parse_request_id(raw_request_id: str) -> Optional[UUID]:
         return UUID(raw_request_id)
     except ValueError:
         return None
+
+
+def _parse_payout_amount(raw_payout_amount: Any) -> Optional[Decimal]:
+    """A positive `Decimal`, or None when the value is unparseable or not
+    strictly positive (booleans included — `Decimal("True")` is invalid)."""
+    try:
+        payout_amount = Decimal(str(raw_payout_amount))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if payout_amount <= 0:
+        return None
+    return payout_amount
 
 
 # ── /api/v1/withdraw/* (auth, self-service) ────────────────────────────────
@@ -179,6 +192,20 @@ def admin_list_withdraw_requests():
     return jsonify({"requests": [row.to_dict() for row in rows]}), 200
 
 
+@withdraw_bp.route("/api/v1/admin/withdraw/requests/<request_id>", methods=["GET"])
+@require_auth
+@require_admin
+def admin_get_withdraw_request(request_id: str):
+    parsed_request_id = _parse_request_id(request_id)
+    if parsed_request_id is None:
+        return jsonify({"error": "Withdraw request not found"}), 404
+    try:
+        row = _withdraw_service().admin_get(parsed_request_id)
+    except WithdrawRequestNotFoundError:
+        return jsonify({"error": "Withdraw request not found"}), 404
+    return jsonify({"request": row.to_dict()}), 200
+
+
 @withdraw_bp.route(
     "/api/v1/admin/withdraw/requests/<request_id>/approve", methods=["POST"]
 )
@@ -188,14 +215,25 @@ def admin_approve_withdraw_request(request_id: str):
     parsed_request_id = _parse_request_id(request_id)
     if parsed_request_id is None:
         return jsonify({"error": "Withdraw request not found"}), 404
+    data = request.get_json(silent=True) or {}
+    payout_amount_override: Optional[Decimal] = None
+    raw_payout_amount = data.get("payout_amount")
+    if raw_payout_amount is not None:
+        payout_amount_override = _parse_payout_amount(raw_payout_amount)
+        if payout_amount_override is None:
+            return jsonify({"error": "Invalid payout amount"}), 400
     try:
-        row = _withdraw_service().approve(parsed_request_id)
+        row = _withdraw_service().approve(
+            parsed_request_id, payout_amount_override=payout_amount_override
+        )
     except WithdrawRequestNotFoundError as error:
         return jsonify({"error": str(error)}), 404
     except InvalidWithdrawStatusError as error:
         return jsonify({"error": str(error)}), 409
     except (UnknownPayoutProviderError, UnknownBalanceSourceError) as error:
         return jsonify({"error": str(error)}), 400
+    except ValueError:
+        return jsonify({"error": "Invalid payout amount"}), 400
     return jsonify({"request": row.to_dict()}), 200
 
 
@@ -219,3 +257,39 @@ def admin_reject_withdraw_request(request_id: str):
     except UnknownBalanceSourceError as error:
         return jsonify({"error": str(error)}), 400
     return jsonify({"request": row.to_dict()}), 200
+
+
+@withdraw_bp.route(
+    "/api/v1/admin/withdraw/requests/<request_id>/pending", methods=["POST"]
+)
+@require_auth
+@require_admin
+def admin_set_withdraw_request_pending(request_id: str):
+    parsed_request_id = _parse_request_id(request_id)
+    if parsed_request_id is None:
+        return jsonify({"error": "Withdraw request not found"}), 404
+    try:
+        row = _withdraw_service().set_pending(parsed_request_id)
+    except WithdrawRequestNotFoundError as error:
+        return jsonify({"error": str(error)}), 404
+    except InvalidWithdrawStatusError as error:
+        return jsonify({"error": str(error)}), 409
+    except (InsufficientBalanceError, UnknownBalanceSourceError) as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"request": row.to_dict()}), 200
+
+
+@withdraw_bp.route("/api/v1/admin/withdraw/requests/<request_id>", methods=["DELETE"])
+@require_auth
+@require_admin
+def admin_delete_withdraw_request(request_id: str):
+    parsed_request_id = _parse_request_id(request_id)
+    if parsed_request_id is None:
+        return jsonify({"error": "Withdraw request not found"}), 404
+    try:
+        _withdraw_service().delete(parsed_request_id)
+    except WithdrawRequestNotFoundError as error:
+        return jsonify({"error": str(error)}), 404
+    except InvalidWithdrawStatusError as error:
+        return jsonify({"error": str(error)}), 409
+    return jsonify({"success": True}), 200
